@@ -4,20 +4,12 @@ import threading
 import requests
 import psycopg2
 import psycopg2.extras
+import uvicorn # We use this to launch the server explicitly
 from mcp.server.fastmcp import FastMCP
 
-# --- 1. GLOBAL CONFIGURATION (CTO FIX) ---
-# Define the Port early so it can be used for initialization
-# Render provides a 'PORT' environment variable (usually 10000)
-PORT_VAL = int(os.environ.get("PORT", 10000))
-
-# Initialize FastMCP with Host/Port logic at the ROOT level
-# This avoids the 'unexpected keyword argument host' error
-mcp = FastMCP(
-    "AnantaSky-Agent-1", 
-    host="0.0.0.0", 
-    port=PORT_VAL
-)
+# --- 1. INITIALIZATION ---
+# We initialize the MCP Server. 
+mcp = FastMCP("AnantaSky-Agent-1")
 
 # Database Credentials
 DB_URL = "postgresql://neondb_owner:npg_qkrxJCsVD23N@ep-frosty-truth-a1puejtv-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
@@ -33,10 +25,9 @@ def self_ping():
     print(f"🚀 Sentinel Active: Monitoring {external_url}")
     while True:
         try:
-            # Pinging the root to maintain activity
+            # We ping the health check or root
             response = requests.get(external_url)
-            if response.status_code != 200:
-                print(f"⚠️ Heartbeat Warning: Status {response.status_code}")
+            # We don't print 200 OK to keep logs clean
         except Exception as e:
             print(f"❌ Heartbeat Error: {e}")
         time.sleep(600)
@@ -73,14 +64,14 @@ def get_active_hunts():
             "hunt_id": r['id'], 
             "route": f"{r['origin']}->{r['destination']}", 
             "date": str(r['travel_date']), 
-            "target": float(r['target_price']),
+            "target": float(r['target_price']), 
             "flex": r['flexibility_days']
         } for r in rows]
     except Exception as e: return f"Retrieval failed: {e}"
 
 @mcp.tool()
 def analyze_price_safety(origin: str, destination: str, days_left: int):
-    """[The Negotiator] Suggests Steal/Fair/Rip-off price bands based on Kaggle data."""
+    """[The Negotiator] Suggests Steal/Fair/Rip-off price bands."""
     conn = get_db_connection()
     if not conn: return "DB Unavailable."
     try:
@@ -102,7 +93,7 @@ def analyze_price_safety(origin: str, destination: str, days_left: int):
 
 @mcp.tool()
 def check_market_trends(origin: str, destination: str, lookback_hours: int = 48):
-    """[Trend Watcher] Checks price_history to see if the market is rising or falling."""
+    """[Trend Watcher] Checks price_history for rising/falling trends."""
     conn = get_db_connection()
     if not conn: return "DB Unavailable."
     try:
@@ -123,9 +114,21 @@ def check_market_trends(origin: str, destination: str, lookback_hours: int = 48)
         return {"trend": "FALLING" if diff < 0 else "RISING" if diff > 0 else "STABLE", "change": abs(diff)}
     except Exception as e: return f"Trend check failed: {e}"
 
-# --- 5. EXECUTION ---
+# --- 5. EXECUTION (THE FIX) ---
 if __name__ == "__main__":
+    # Start the Sentinel
     start_heartbeat()
-    print(f"✅ Ananta Sky Agent Initializing on Port {PORT_VAL}...")
-    # Simplified run call: host/port are handled at initialization
-    mcp.run(transport="sse")
+    
+    # Get the PORT from Render (default 10000)
+    port = int(os.environ.get("PORT", 10000))
+    print(f"✅ Ananta Sky Agent Starting on Port {port}...")
+
+    # RAM'S FIX: 
+    # Instead of mcp.run() which is broken for cloud binding,
+    # we explicitly use uvicorn to run the internal MCP app.
+    # This guarantees we can bind to 0.0.0.0.
+    
+    # 1. Start the server logic
+    # 2. Bind to 0.0.0.0 (Required for Render)
+    # 3. Use the correct port
+    uvicorn.run(mcp._mcp_server.app, host="0.0.0.0", port=port)
