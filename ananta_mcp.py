@@ -6,32 +6,32 @@ import psycopg2
 import psycopg2.extras
 import uvicorn
 from fastapi import FastAPI, Request
-from sse_starlette.sse import EventSourceResponse
+from fastapi.responses import JSONResponse
 from mcp.server import Server
 from mcp.types import TextContent, Tool
 
-# --- 1. INITIALIZATION (THE STABLE WAY) ---
-# We use the base Server class directly
+# --- 1. CORE INITIALIZATION ---
 app = FastAPI()
 mcp_server = Server("AnantaSky-Agent-1")
 
 # Database Credentials
 DB_URL = "postgresql://neondb_owner:npg_qkrxJCsVD23N@ep-frosty-truth-a1puejtv-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
 
-# --- 2. THE SENTINEL (24/7 HEARTBEAT) ---
-def self_ping():
-    external_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not external_url: return
-    while True:
-        try:
-            requests.get(external_url + "/health")
-        except:
-            pass
-        time.sleep(600)
-
+# --- 2. THE SENTINEL & HEALTH CHECK ---
 @app.get("/health")
 async def health():
-    return {"status": "alive"}
+    """Direct, high-priority route for Render health checks."""
+    return {"status": "alive", "timestamp": time.time()}
+
+def self_ping():
+    """Keeps the instance from sleeping on Render's free tier."""
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url: return
+    while True:
+        try:
+            requests.get(f"{url}/health")
+        except: pass
+        time.sleep(600)
 
 # --- 3. DATABASE UTILITIES ---
 def get_db_connection():
@@ -41,26 +41,23 @@ def get_db_connection():
         print(f"🔥 DB Error: {e}")
         return None
 
-# --- 4. THE AGENT TOOLS (MAPPED MANUALLY FOR STABILITY) ---
-
+# --- 4. MCP TOOL DEFINITIONS ---
 @mcp_server.list_tools()
 async def list_tools():
-    """Defines the tools available to Groq."""
     return [
         Tool(
             name="get_active_hunts",
-            description="[Auto-Pilot] Retrieves active trips for monitoring.",
+            description="[Auto-Pilot] Retrieves all active flight hunts.",
             inputSchema={"type": "object", "properties": {}}
         ),
         Tool(
-            name="analyze_price_safety",
-            description="[The Negotiator] Pulls Kaggle metrics for price bands.",
+            name="check_market_trends",
+            description="[Trend Watcher] Checks if prices are rising or falling.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "origin": {"type": "string"},
-                    "destination": {"type": "string"},
-                    "days_left": {"type": "integer"}
+                    "destination": {"type": "string"}
                 }
             }
         )
@@ -68,45 +65,41 @@ async def list_tools():
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict):
-    """Executes the database logic for each tool."""
     conn = get_db_connection()
-    if not conn: return [TextContent(type="text", text="DB Error")]
+    if not conn: return [TextContent(type="text", text="Database offline.")]
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     
-    if name == "get_active_hunts":
-        cur.execute("SELECT origin, destination, travel_date FROM watchlist WHERE is_active = TRUE")
-        rows = cur.fetchall()
-        res = str([dict(r) for r in rows])
-    elif name == "analyze_price_safety":
-        cur.execute("SELECT avg_price, min_price FROM baseline_metrics WHERE origin = %s AND destination = %s AND days_left = %s", 
-                    (arguments['origin'].upper(), arguments['destination'].upper(), arguments['days_left']))
-        row = cur.fetchone()
-        res = str(dict(row)) if row else "No data"
+    try:
+        if name == "get_active_hunts":
+            cur.execute("SELECT origin, destination, travel_date, target_price FROM watchlist WHERE is_active = TRUE")
+            res = str([dict(r) for r in cur.fetchall()])
+        elif name == "check_market_trends":
+            # Any-to-Any logic: works for any origin/destination pair
+            query = "SELECT ph.price FROM price_history ph JOIN watchlist w ON ph.route_id = w.id WHERE w.origin = %s AND w.destination = %s ORDER BY ph.timestamp DESC LIMIT 5"
+            cur.execute(query, (arguments['origin'].upper(), arguments['destination'].upper()))
+            res = str([r[0] for r in cur.fetchall()])
+        else:
+            res = "Tool not found."
+    finally:
+        cur.close()
+        conn.close()
     
-    cur.close()
-    conn.close()
     return [TextContent(type="text", text=res)]
 
-# --- 5. THE TRANSPORT BRIDGE (SSE) ---
-# This manual route replaces the broken 'StarletteServerTransport'
-@app.get("/sse")
-async def sse(request: Request):
-    async def event_generator():
-        # This keeps the connection open for the AI
-        yield {"data": "connected"}
-        while True:
-            if await request.is_disconnected(): break
-            time.sleep(1)
-    return EventSourceResponse(event_generator())
-
+# --- 5. THE MCP COMMUNICATION BRIDGE ---
 @app.post("/messages")
-async def messages(request: Request):
-    # This handles the actual tool requests
-    return await mcp_server.handle_request(await request.json())
+async def handle_messages(request: Request):
+    """The main endpoint where Groq sends instructions."""
+    payload = await request.json()
+    response = await mcp_server.handle_request(payload)
+    return JSONResponse(content=response)
 
 # --- 6. EXECUTION ---
 if __name__ == "__main__":
+    # Start Heartbeat in background
     threading.Thread(target=self_ping, daemon=True).start()
+    
+    # Bind to 0.0.0.0 and use the port assigned by Render
     port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Ananta Sky LIVE on Port {port}")
+    print(f"🚀 Ananta Sky Agent LIVE on Port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
