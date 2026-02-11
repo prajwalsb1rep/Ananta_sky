@@ -4,131 +4,88 @@ import threading
 import requests
 import psycopg2
 import psycopg2.extras
-import uvicorn # We use this to launch the server explicitly
+import uvicorn
+from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
 
 # --- 1. INITIALIZATION ---
-# We initialize the MCP Server. 
 mcp = FastMCP("AnantaSky-Agent-1")
+# Extract the underlying FastAPI app so we can add a health check
+app = mcp._mcp_server.app
 
 # Database Credentials
 DB_URL = "postgresql://neondb_owner:npg_qkrxJCsVD23N@ep-frosty-truth-a1puejtv-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
 
 # --- 2. THE SENTINEL (24/7 HEARTBEAT) ---
 def self_ping():
-    """Pings the server's own URL every 10 minutes to stay awake on Render."""
     external_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not external_url:
-        print("⚠️ No RENDER_EXTERNAL_URL found. Self-ping inactive.")
-        return
-
+    if not external_url: return
     print(f"🚀 Sentinel Active: Monitoring {external_url}")
     while True:
         try:
-            # We ping the health check or root
-            response = requests.get(external_url)
-            # We don't print 200 OK to keep logs clean
-        except Exception as e:
-            print(f"❌ Heartbeat Error: {e}")
+            requests.get(external_url)
+        except:
+            pass
         time.sleep(600)
 
-def start_heartbeat():
-    """Runs the Sentinel in a background thread."""
-    thread = threading.Thread(target=self_ping, daemon=True)
-    thread.start()
+@app.get("/health")
+def health_check():
+    """Standard health check route for Render."""
+    return {"status": "alive", "agent": "AnantaSky"}
 
 # --- 3. DATABASE UTILITIES ---
 def get_db_connection():
-    """Robust connection to Neon Postgres."""
     try:
-        conn = psycopg2.connect(DB_URL)
-        return conn
+        return psycopg2.connect(DB_URL)
     except Exception as e:
         print(f"🔥 DB Error: {e}")
         return None
 
 # --- 4. THE AGENT TOOLS ---
-
 @mcp.tool()
 def get_active_hunts():
-    """[Auto-Pilot] Retrieves active trips and flexibility data from the database."""
+    """[Auto-Pilot] Retrieves active trips and flexibility data."""
     conn = get_db_connection()
     if not conn: return "DB Unavailable."
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute("SELECT id, origin, destination, travel_date, target_price, flexibility_days FROM watchlist WHERE is_active = TRUE")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return [{
-            "hunt_id": r['id'], 
-            "route": f"{r['origin']}->{r['destination']}", 
-            "date": str(r['travel_date']), 
-            "target": float(r['target_price']), 
-            "flex": r['flexibility_days']
-        } for r in rows]
-    except Exception as e: return f"Retrieval failed: {e}"
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT id, origin, destination, travel_date, target_price, flexibility_days FROM watchlist WHERE is_active = TRUE")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"id": r[0], "route": f"{r[1]}->{r[2]}", "date": str(r[3]), "target": float(r[4])} for r in rows]
 
 @mcp.tool()
 def analyze_price_safety(origin: str, destination: str, days_left: int):
-    """[The Negotiator] Suggests Steal/Fair/Rip-off price bands."""
+    """[The Negotiator] Suggests Steal/Fair price bands."""
     conn = get_db_connection()
     if not conn: return "DB Unavailable."
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        query = "SELECT avg_price, min_price FROM baseline_metrics WHERE origin = %s AND destination = %s AND days_left = %s"
-        cur.execute(query, (origin.upper(), destination.upper(), days_left))
-        data = cur.fetchone()
-        cur.close()
-        conn.close()
-        if not data: return "No history found."
-        min_p = float(data['min_price'])
-        avg_p = float(data['avg_price'])
-        return {
-            "steal_zone": f"₹{min_p} - ₹{min_p * 1.1:.0f}",
-            "fair_zone": f"₹{min_p * 1.1:.0f} - ₹{avg_p:.0f}",
-            "average": avg_p
-        }
-    except Exception as e: return f"Analysis failed: {e}"
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT avg_price, min_price FROM baseline_metrics WHERE origin = %s AND destination = %s AND days_left = %s", (origin.upper(), destination.upper(), days_left))
+    data = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not data: return "No history."
+    return {"steal": float(data[1]), "fair": float(data[0])}
 
 @mcp.tool()
 def check_market_trends(origin: str, destination: str, lookback_hours: int = 48):
-    """[Trend Watcher] Checks price_history for rising/falling trends."""
+    """[Trend Watcher] Checks price_history for market momentum."""
     conn = get_db_connection()
     if not conn: return "DB Unavailable."
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        query = """
-            SELECT ph.price FROM price_history ph 
-            JOIN watchlist w ON ph.route_id = w.id 
-            WHERE w.origin = %s AND w.destination = %s 
-            AND ph.timestamp > NOW() - INTERVAL '%s hours' 
-            ORDER BY ph.timestamp ASC
-        """
-        cur.execute(query, (origin.upper(), destination.upper(), str(lookback_hours)))
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        if len(rows) < 2: return "Insufficient data for trend."
-        diff = float(rows[-1][0]) - float(rows[0][0])
-        return {"trend": "FALLING" if diff < 0 else "RISING" if diff > 0 else "STABLE", "change": abs(diff)}
-    except Exception as e: return f"Trend check failed: {e}"
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    query = "SELECT ph.price FROM price_history ph JOIN watchlist w ON ph.route_id = w.id WHERE w.origin = %s AND w.destination = %s AND ph.timestamp > NOW() - INTERVAL '%s hours' ORDER BY ph.timestamp ASC"
+    cur.execute(query, (origin.upper(), destination.upper(), str(lookback_hours)))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    if len(rows) < 2: return "No trend data."
+    diff = float(rows[-1][0]) - float(rows[0][0])
+    return {"trend": "FALLING" if diff < 0 else "RISING", "change": abs(diff)}
 
-# --- 5. EXECUTION (THE FIX) ---
+# --- 5. EXECUTION ---
 if __name__ == "__main__":
-    # Start the Sentinel
-    start_heartbeat()
-    
-    # Get the PORT from Render (default 10000)
+    threading.Thread(target=self_ping, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     print(f"✅ Ananta Sky Agent Starting on Port {port}...")
-
-    # RAM'S FIX: 
-    # Instead of mcp.run() which is broken for cloud binding,
-    # we explicitly use uvicorn to run the internal MCP app.
-    # This guarantees we can bind to 0.0.0.0.
-    
-    # 1. Start the server logic
-    # 2. Bind to 0.0.0.0 (Required for Render)
-    # 3. Use the correct port
-    uvicorn.run(mcp._mcp_server.app, host="0.0.0.0", port=port)
+    # Explicitly run the app via uvicorn on all interfaces
+    uvicorn.run(app, host="0.0.0.0", port=port)
