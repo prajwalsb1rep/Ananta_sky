@@ -29,8 +29,8 @@ def self_ping():
     print(f"🚀 Sentinel Active: Monitoring {external_url}")
     while True:
         try:
-            response = requests.get(f"{external_url}/health")
-            # We don't print every success to keep logs clean, only errors
+            # We ping the /sse endpoint or just the root to keep it awake
+            response = requests.get(f"{external_url}")
             if response.status_code != 200:
                 print(f"⚠️ Heartbeat Warning: Status {response.status_code}")
         except Exception as e:
@@ -197,12 +197,15 @@ def check_market_trends(origin: str, destination: str, lookback_hours: int = 48)
     except Exception as e:
         return f"Trend analysis failed: {e}"
 
-# --- 4. EXECUTION ---
+# --- 4. EXECUTION (The Corrected Part) ---
 if __name__ == "__main__":
-    # Start the Sentinel first
+    # Start the Sentinel first to keep the app awake
     print("🤖 Ananta Sky Agent: Initializing...")
     start_heartbeat()
     
-    # Run the MCP Server
-    print("✅ MCP Server Running. Waiting for Groq commands...")
-    mcp.run()
+    # 1. GET PORT: Render provides a PORT environment variable. We default to 8000 for local testing.
+    port = int(os.environ.get("PORT", 8000))
+    
+    # 2. RUN SERVER: We MUST use '0.0.0.0' and 'sse' transport for Render Web Services
+    print(f"✅ MCP Server Starting on Port {port}...")
+    mcp.run(transport="sse", host="0.0.0.0", port=port)
